@@ -1,0 +1,179 @@
+name: deploy-model
+
+# Full CI/CD pipeline for the Vision Moderation model service.
+# lint -> test -> build -> scan -> push -> deploy-staging -> smoke-staging -> deploy-production
+# Each stage is its own job and depends on the previous one via `needs:`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to the same ref cancels an in-flight pipeline for that ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: read source, write packages (GHCR).
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # 1. Lint the API contract and the Dockerfile.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lint OpenAPI spec (Spectral)
+        run: npx --yes @stoplight/spectral-cli lint openapi.yaml
+
+      - name: Lint Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+  # 2. Unit + contract tests (provided black-box scripts).
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Unit tests
+        run: ./scripts/test-unit.sh
+
+      - name: Contract tests
+        run: ./scripts/test-contract.sh
+
+  # 3. Build the image, tagged ghcr.io/<repo>:<git-sha>. Do NOT push yet.
+  #    The image is exported as a tarball artifact so `scan` can gate `push`.
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image reference (lowercased repo + git SHA)
+        id: meta
+        run: |
+          repo="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "image=${REGISTRY}/${repo}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (export to tarball, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ${{ steps.meta.outputs.image }}
+          outputs: type=docker,dest=/tmp/image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: image
+          path: /tmp/image.tar
+          retention-days: 1
+
+  # 4. Trivy scan — fail the build on HIGH or CRITICAL vulnerabilities.
+  scan:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: /tmp
+
+      - name: Load image
+        run: docker load --input /tmp/image.tar
+
+      - name: Trivy scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ needs.build.outputs.image }}
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          ignore-unfixed: false
+
+  # 5. Push the scanned image to GHCR.
+  push:
+    needs: [build, scan]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: image
+          path: /tmp
+
+      - name: Load image
+        run: docker load --input /tmp/image.tar
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Push image
+        run: docker push "${{ needs.build.outputs.image }}"
+
+  # 6. Deploy to staging — only on push to main (not on PRs).
+  deploy-staging:
+    needs: [build, push]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply manifests to staging
+        run: ./scripts/deploy.sh staging "${{ needs.build.outputs.image }}"
+
+  # 7. Smoke test the freshly deployed staging environment.
+  smoke-staging:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Smoke test staging
+        run: ./scripts/smoke.sh staging
+
+  # 8. Production deploy — gated by the `production` environment (required approvers).
+  #    Canary at 10% -> verify -> full rollout.
+  deploy-production:
+    needs: [build, smoke-staging]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Canary rollout (10%)
+        run: ./scripts/deploy.sh production "${{ needs.build.outputs.image }}" --canary 10
+
+      - name: Verify canary
+        run: ./scripts/canary-verify.sh production "${{ needs.build.outputs.image }}"
+
+      - name: Full rollout
+        run: ./scripts/deploy.sh production "${{ needs.build.outputs.image }}" --full
